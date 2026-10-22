@@ -1,0 +1,6 @@
+{
+  "name": "Seat Checker",
+  "description": "Real-time seat availability checker, layout inspector, and reservation monitor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
