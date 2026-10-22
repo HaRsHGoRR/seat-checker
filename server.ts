@@ -177,7 +177,8 @@ async function startServer() {
 
   app.all('/api/check-dual-seats', async (req, res) => {
     try {
-      const body = req.method === 'GET' ? {} : req.body || {};
+      const isGet = req.method === 'GET';
+      const body = isGet ? {} : req.body || {};
       const query = req.query || {};
 
       const {
@@ -223,31 +224,81 @@ async function startServer() {
       runtimeConfig.service1Url = url1;
       runtimeConfig.service2Url = url2;
 
-      const service1Probe = await probeSingleGsrtcService({
-        rawUrl: url1,
-        cookie: activeCookie,
-        journeyDate: activeDate,
-      });
-      const service2Probe = await probeSingleGsrtcService({
-        rawUrl: url2,
-        cookie: activeCookie,
-        journeyDate: activeDate,
-      });
-
-      const s1Open = service1Probe.result.availableCount;
-      const s2Open = service2Probe.result.availableCount;
-      const totalOpen = s1Open + s2Open;
-      console.log(
-        `[GSRTC POLL] ${new Date().toLocaleTimeString('en-US', { hour12: false })} | Date: ${activeDate} | 52769 (Seater): ${s1Open}/${service1Probe.result.totalSeats} Open | 52767 (Sleeper): ${s2Open}/${service2Probe.result.totalSeats} Open`
+      const explicitLoops = Number(query.loops || body.loops || 0);
+      const loopsToRun = explicitLoops > 0 ? Math.min(explicitLoops, 6) : 1;
+      const intervalSec = Math.min(
+        Math.max(Number(query.intervalSec || body.intervalSec || 10), 2),
+        20
       );
+
+      let lastService1Probe: Awaited<ReturnType<typeof probeSingleGsrtcService>> | null =
+        null;
+      let lastService2Probe: Awaited<ReturnType<typeof probeSingleGsrtcService>> | null =
+        null;
+      const checksSummary: Array<{
+        checkNumber: number;
+        timestamp: string;
+        s1Open: number;
+        s2Open: number;
+        totalOpen: number;
+        latencyMs: number;
+      }> = [];
+
+      for (let i = 0; i < loopsToRun; i++) {
+        const loopStartMs = Date.now();
+        const [service1Probe, service2Probe] = await Promise.all([
+          probeSingleGsrtcService({
+            rawUrl: url1,
+            cookie: activeCookie,
+            journeyDate: activeDate,
+          }),
+          probeSingleGsrtcService({
+            rawUrl: url2,
+            cookie: activeCookie,
+            journeyDate: activeDate,
+          }),
+        ]);
+
+        lastService1Probe = service1Probe;
+        lastService2Probe = service2Probe;
+
+        const s1Open = service1Probe.result.availableCount;
+        const s2Open = service2Probe.result.availableCount;
+        const totalOpen = s1Open + s2Open;
+
+        console.log(
+          `[GSRTC POLL #${i + 1}/${loopsToRun}] ${new Date().toLocaleTimeString('en-US', { hour12: false })} | Date: ${activeDate} | 52769 (Seater): ${s1Open}/${service1Probe.result.totalSeats} Open | 52767 (Sleeper): ${s2Open}/${service2Probe.result.totalSeats} Open`
+        );
+
+        checksSummary.push({
+          checkNumber: i + 1,
+          timestamp: new Date().toISOString(),
+          s1Open,
+          s2Open,
+          totalOpen,
+          latencyMs: Date.now() - loopStartMs,
+        });
+
+        if (i < loopsToRun - 1) {
+          const elapsedMs = Date.now() - loopStartMs;
+          const waitMs = Math.max(1000, intervalSec * 1000 - elapsedMs);
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+        }
+      }
+
+      const s1Open = lastService1Probe?.result.availableCount ?? 0;
+      const s2Open = lastService2Probe?.result.availableCount ?? 0;
+      const totalOpen = s1Open + s2Open;
 
       return res.json({
         ok: true,
         journeyDate: activeDate,
         ntfyTopic: runtimeConfig.ntfyTopic,
+        checksCompletedInThisCall: checksSummary.length,
+        checksSummary,
         totalOpen,
-        service1: service1Probe,
-        service2: service2Probe,
+        service1: lastService1Probe,
+        service2: lastService2Probe,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Dual check error';

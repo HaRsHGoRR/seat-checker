@@ -121,6 +121,71 @@ if (!globalStore.__gsrtcRuntimeConfig) {
   };
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function sendNtfyAndCallAlert(params: {
+  ntfyTopic: string;
+  callmebotUrl: string;
+  activeDate: string;
+  totalOpen: number;
+  s1Open: number;
+  s2Open: number;
+  s1Labels: string[];
+  s2Labels: string[];
+  checkLabel: string;
+}): Promise<boolean> {
+  let sent = false;
+  const cleanTopic = String(params.ntfyTopic || '')
+    .trim()
+    .replace(/^https?:\/\/ntfy\.sh\//i, '')
+    .replace(/[^a-zA-Z0-9_-]/g, '');
+
+  if (cleanTopic) {
+    const s1LabelsText = params.s1Labels.join(', ') || 'None';
+    const s2LabelsText = params.s2Labels.join(', ') || 'None';
+    const title = toSafeByteStringHeader(
+      `GSRTC OPEN: ${params.totalOpen} Seat(s) on ${params.activeDate}`
+    );
+    const message = [
+      `Route: BARODA CENTRAL BUS STATION -> VERAVAL`,
+      `Date: ${params.activeDate} (21:00 Dept) [${params.checkLabel}]`,
+      `Seater 52769 (INR 328): ${params.s1Open} open (${s1LabelsText})`,
+      `Sleeper 52767 (INR 423): ${params.s2Open} open (${s2LabelsText})`,
+      `Book now: https://gsrtc.in/OPRSOnline/`,
+    ].join('\n');
+
+    try {
+      const ntfyRes = await fetch(
+        `https://ntfy.sh/${encodeURIComponent(cleanTopic)}`,
+        {
+          method: 'POST',
+          headers: {
+            Title: title,
+            Priority: '5',
+            Tags: 'bus,rotating_light,white_check_mark',
+            Click: 'https://gsrtc.in/OPRSOnline/',
+            'Content-Type': 'text/plain; charset=utf-8',
+          },
+          body: message,
+        }
+      );
+      sent = ntfyRes.ok;
+    } catch {
+      sent = false;
+    }
+  }
+
+  if (params.callmebotUrl && params.callmebotUrl.startsWith('http')) {
+    try {
+      await fetch(params.callmebotUrl, { method: 'GET' });
+    } catch {
+      // ignore callmebot error
+    }
+  }
+
+  return sent;
+}
+
 export default async function handler(req: any, res: any) {
   res.setHeader(
     'Cache-Control',
@@ -188,93 +253,183 @@ export default async function handler(req: any, res: any) {
     const url2 = ramConfig.service2Url || SERVICE_2_SLEEPER_URL;
     const ntfyTopic = ramConfig.ntfyTopic || 'gsrtc-seat-radar-harsh-52769';
 
-    const service1Probe = await probeSingleGsrtcService({
-      rawUrl: url1,
-      cookie: activeCookie,
-      journeyDate: activeDate,
-    });
-    const service2Probe = await probeSingleGsrtcService({
-      rawUrl: url2,
-      cookie: activeCookie,
-      journeyDate: activeDate,
-    });
+    const halfParam = String(query.half || body.half || '');
+    const explicitLoops = Number(query.loops || body.loops || 0);
+    const intervalSec = Math.min(
+      Math.max(Number(query.intervalSec || body.intervalSec || 10), 2),
+      20
+    );
 
-    const s1Open = service1Probe.result.availableCount;
-    const s2Open = service2Probe.result.availableCount;
-    const totalOpen = s1Open + s2Open;
+    // Determine execution mode:
+    // 1. UI POST (no half, no loops): 1 immediate check so UI stays fast (~1s).
+    // 2. Cron GET (default, no params needed): 6 checks per minute (every 10s)!
+    //    - Half 1 runs Checks #1 (0s), #2 (10s), #3 (20s) (~21s total, well under cron-job.org's 30s timeout)
+    //      and spawns Half 2 in parallel at t=0s.
+    //    - Half 2 (?half=2) sleeps until t=30s and runs Checks #4 (30s), #5 (40s), #6 (50s).
+    // 3. Explicit ?loops=N (e.g. ?loops=6 or ?loops=1): runs N checks in this request.
+    let loopsToRun = 1;
+    let initialDelayMs = 0;
+    let spawnSecondHalf = false;
+    let checkIndexOffset = 0;
 
-    let cronNotificationSent = false;
-    // When triggered via GET (e.g. 24/7 external cron job with no browser open),
-    // automatically send the ntfy.sh push notification if any seat is open.
-    if ((isGet || body.autoNotify === true) && totalOpen > 0 && ntfyTopic) {
-      const cleanTopic = String(ntfyTopic)
-        .trim()
-        .replace(/^https?:\/\/ntfy\.sh\//i, '')
-        .replace(/[^a-zA-Z0-9_-]/g, '');
+    if (explicitLoops > 0) {
+      loopsToRun = Math.min(explicitLoops, 6);
+    } else if (halfParam === '2') {
+      loopsToRun = 3;
+      initialDelayMs = 29000; // Wake up at ~30s mark for checks #4 (30s), #5 (40s), #6 (50s)
+      checkIndexOffset = 3;
+    } else if (isGet) {
+      loopsToRun = 3; // Checks #1 (0s), #2 (10s), #3 (20s) -> responds in ~21s (<30s cron-job.org limit)
+      spawnSecondHalf = true;
+    }
 
-      if (cleanTopic) {
-        const s1Labels =
-          service1Probe.result.openSeatLabels.join(', ') || 'None';
-        const s2Labels =
-          service2Probe.result.openSeatLabels.join(', ') || 'None';
-        const title = toSafeByteStringHeader(
-          `GSRTC OPEN: ${totalOpen} Seat(s) on ${activeDate}`
-        );
-        const message = [
-          `Route: BARODA CENTRAL BUS STATION -> VERAVAL`,
-          `Date: ${activeDate} (21:00 Dept)`,
-          `Seater 52769 (INR 328): ${s1Open} open (${s1Labels})`,
-          `Sleeper 52767 (INR 423): ${s2Open} open (${s2Labels})`,
-          `Book now: https://gsrtc.in/OPRSOnline/`,
-        ].join('\n');
+    // Fire companion Half 2 at t=0s so Vercel starts the second container while Half 1 stays alive for 21s
+    let backgroundHalf2Promise: Promise<unknown> | null = null;
+    if (spawnSecondHalf) {
+      const proto = req.headers?.['x-forwarded-proto'] || 'https';
+      const host =
+        req.headers?.['x-forwarded-host'] ||
+        req.headers?.host ||
+        'seat-checker-taupe.vercel.app';
+      const selfUrl = `${proto}://${host}/api/check-dual-seats?half=2`;
 
-        try {
-          const ntfyRes = await fetch(
-            `https://ntfy.sh/${encodeURIComponent(cleanTopic)}`,
-            {
-              method: 'POST',
-              headers: {
-                Title: title,
-                Priority: '5',
-                Tags: 'bus,rotating_light,white_check_mark',
-                Click: 'https://gsrtc.in/OPRSOnline/',
-                'Content-Type': 'text/plain; charset=utf-8',
-              },
-              body: message,
-            }
-          );
-          cronNotificationSent = ntfyRes.ok;
-        } catch {
-          cronNotificationSent = false;
+      backgroundHalf2Promise = fetch(selfUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          half: '2',
+          autoNotify: true,
+          journeyDate: activeDate,
+          cookie: activeCookie,
+          service1Url: url1,
+          service2Url: url2,
+          ntfyTopic,
+          callmebotUrl: ramConfig.callmebotUrl,
+        }),
+      }).catch(() => null);
+    }
+
+    if (initialDelayMs > 0) {
+      await sleep(initialDelayMs);
+    }
+
+    let lastService1Probe: Awaited<ReturnType<typeof probeSingleGsrtcService>> | null =
+      null;
+    let lastService2Probe: Awaited<ReturnType<typeof probeSingleGsrtcService>> | null =
+      null;
+    let anyNotificationSent = false;
+    let maxTotalOpen = 0;
+    const checksSummary: Array<{
+      checkNumber: number;
+      timestamp: string;
+      s1Open: number;
+      s2Open: number;
+      totalOpen: number;
+      notified: boolean;
+      latencyMs: number;
+    }> = [];
+
+    for (let i = 0; i < loopsToRun; i++) {
+      const loopStartMs = Date.now();
+      const checkNumber = checkIndexOffset + i + 1;
+
+      const [service1Probe, service2Probe] = await Promise.all([
+        probeSingleGsrtcService({
+          rawUrl: url1,
+          cookie: activeCookie,
+          journeyDate: activeDate,
+        }),
+        probeSingleGsrtcService({
+          rawUrl: url2,
+          cookie: activeCookie,
+          journeyDate: activeDate,
+        }),
+      ]);
+
+      lastService1Probe = service1Probe;
+      lastService2Probe = service2Probe;
+
+      const s1Open = service1Probe.result.availableCount;
+      const s2Open = service2Probe.result.availableCount;
+      const totalOpen = s1Open + s2Open;
+
+      let notifiedThisTick = false;
+      const shouldNotify =
+        (isGet || body.autoNotify === true) &&
+        totalOpen > 0 &&
+        Boolean(ntfyTopic) &&
+        (!anyNotificationSent || totalOpen > maxTotalOpen);
+
+      if (shouldNotify) {
+        notifiedThisTick = await sendNtfyAndCallAlert({
+          ntfyTopic,
+          callmebotUrl: ramConfig.callmebotUrl,
+          activeDate,
+          totalOpen,
+          s1Open,
+          s2Open,
+          s1Labels: service1Probe.result.openSeatLabels,
+          s2Labels: service2Probe.result.openSeatLabels,
+          checkLabel: `Check #${checkNumber}/6`,
+        });
+        if (notifiedThisTick) {
+          anyNotificationSent = true;
         }
       }
 
-      if (
-        ramConfig.callmebotUrl &&
-        ramConfig.callmebotUrl.startsWith('http')
-      ) {
-        try {
-          await fetch(ramConfig.callmebotUrl, { method: 'GET' });
-        } catch {
-          // ignore callmebot error
-        }
+      if (totalOpen > maxTotalOpen) {
+        maxTotalOpen = totalOpen;
+      }
+
+      checksSummary.push({
+        checkNumber,
+        timestamp: new Date().toISOString(),
+        s1Open,
+        s2Open,
+        totalOpen,
+        notified: notifiedThisTick,
+        latencyMs: Date.now() - loopStartMs,
+      });
+
+      if (i < loopsToRun - 1) {
+        const elapsedMs = Date.now() - loopStartMs;
+        const waitMs = Math.max(1000, intervalSec * 1000 - elapsedMs);
+        await sleep(waitMs);
       }
     }
+
+    // Ensure the background request socket was flushed before returning
+    if (backgroundHalf2Promise) {
+      await Promise.race([backgroundHalf2Promise, sleep(250)]);
+    }
+
+    const s1Open = lastService1Probe?.result.availableCount ?? 0;
+    const s2Open = lastService2Probe?.result.availableCount ?? 0;
+    const totalOpen = s1Open + s2Open;
 
     return res.status(200).json({
       ok: true,
       journeyDate: activeDate,
       ntfyTopic,
       configUpdatedAt: ramConfig.updatedAt,
+      pollingMode: spawnSecondHalf
+        ? '6x-per-minute (10s interval: checks #1-#3 complete, checks #4-#6 running in background half=2)'
+        : halfParam === '2'
+          ? '6x-per-minute (10s interval: checks #4-#6 complete)'
+          : `direct (${loopsToRun} check${loopsToRun > 1 ? 's' : ''})`,
+      checksCompletedInThisCall: checksSummary.length,
+      checksSummary,
       totalOpen,
-      cronNotificationSent,
-      service1: service1Probe,
-      service2: service2Probe,
+      maxTotalOpenInBurst: maxTotalOpen,
+      cronNotificationSent: anyNotificationSent,
+      service1: lastService1Probe,
+      service2: lastService2Probe,
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Dual check error';
     return res.status(500).json({ ok: false, error: msg });
   }
 }
+
 
 
