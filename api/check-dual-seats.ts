@@ -88,17 +88,39 @@ async function probeSingleGsrtcService(params: {
   }
 }
 
+function toSafeByteStringHeader(input: string): string {
+  return input
+    .replace(/[\u2014\u2013]/g, '-')
+    .replace(/[^\x20-\x7E]/g, '')
+    .trim();
+}
+
 export default async function handler(req: any, res: any) {
-  if (req.method !== 'POST') {
+  if (req.method !== 'POST' && req.method !== 'GET') {
     return res.status(405).json({ ok: false, error: 'Method Not Allowed' });
   }
 
   try {
-    const body =
-      typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
-    const { service1Url, service2Url, cookie, journeyDate } = body;
+    const isGet = req.method === 'GET';
+    const query = req.query || {};
+    const body = isGet
+      ? {}
+      : typeof req.body === 'string'
+        ? JSON.parse(req.body || '{}')
+        : req.body || {};
 
-    const activeDate = normalizeGsrtcDate(journeyDate || DEFAULT_JOURNEY_DATE);
+    const journeyDate = body.journeyDate || query.date || DEFAULT_JOURNEY_DATE;
+    const cookie =
+      body.cookie || query.cookie || process.env.GSRTC_COOKIE || DEFAULT_GSRTC_COOKIE;
+    const service1Url = body.service1Url || SERVICE_1_SEATER_URL;
+    const service2Url = body.service2Url || SERVICE_2_SLEEPER_URL;
+    const ntfyTopic =
+      body.ntfyTopic ||
+      query.topic ||
+      process.env.NTFY_TOPIC ||
+      'gsrtc-seat-radar-harsh-52769';
+
+    const activeDate = normalizeGsrtcDate(journeyDate);
     const activeCookie =
       (typeof cookie === 'string' && cookie.trim()) || DEFAULT_GSRTC_COOKIE;
     const url1 =
@@ -119,9 +141,60 @@ export default async function handler(req: any, res: any) {
       journeyDate: activeDate,
     });
 
+    const s1Open = service1Probe.result.availableCount;
+    const s2Open = service2Probe.result.availableCount;
+    const totalOpen = s1Open + s2Open;
+
+    let cronNotificationSent = false;
+    // When triggered via GET (e.g. 24/7 external cron job with no browser open),
+    // automatically send the ntfy.sh push notification if any seat is open.
+    if ((isGet || body.autoNotify === true) && totalOpen > 0 && ntfyTopic) {
+      const cleanTopic = String(ntfyTopic)
+        .trim()
+        .replace(/^https?:\/\/ntfy\.sh\//i, '')
+        .replace(/[^a-zA-Z0-9_-]/g, '');
+
+      if (cleanTopic) {
+        const s1Labels = service1Probe.result.openSeatLabels.join(', ') || 'None';
+        const s2Labels = service2Probe.result.openSeatLabels.join(', ') || 'None';
+        const title = toSafeByteStringHeader(
+          `GSRTC OPEN: ${totalOpen} Seat(s) on ${activeDate}`
+        );
+        const message = [
+          `Route: BARODA CENTRAL BUS STATION -> VERAVAL`,
+          `Date: ${activeDate} (21:00 Dept)`,
+          `Seater 52769 (INR 328): ${s1Open} open (${s1Labels})`,
+          `Sleeper 52767 (INR 423): ${s2Open} open (${s2Labels})`,
+          `Book now: https://gsrtc.in/OPRSOnline/`,
+        ].join('\n');
+
+        try {
+          const ntfyRes = await fetch(
+            `https://ntfy.sh/${encodeURIComponent(cleanTopic)}`,
+            {
+              method: 'POST',
+              headers: {
+                Title: title,
+                Priority: '5',
+                Tags: 'bus,rotating_light,white_check_mark',
+                Click: 'https://gsrtc.in/OPRSOnline/',
+                'Content-Type': 'text/plain; charset=utf-8',
+              },
+              body: message,
+            }
+          );
+          cronNotificationSent = ntfyRes.ok;
+        } catch {
+          cronNotificationSent = false;
+        }
+      }
+    }
+
     return res.status(200).json({
       ok: true,
       journeyDate: activeDate,
+      totalOpen,
+      cronNotificationSent,
       service1: service1Probe,
       service2: service2Probe,
     });
@@ -130,3 +203,4 @@ export default async function handler(req: any, res: any) {
     return res.status(500).json({ ok: false, error: msg });
   }
 }
+
