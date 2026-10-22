@@ -95,12 +95,39 @@ function toSafeByteStringHeader(input: string): string {
     .trim();
 }
 
+interface RuntimeSeatConfig {
+  journeyDate: string;
+  cookie: string;
+  service1Url: string;
+  service2Url: string;
+  ntfyTopic: string;
+  callmebotUrl: string;
+  updatedAt: string;
+}
+
+const globalStore = globalThis as unknown as {
+  __gsrtcRuntimeConfig?: RuntimeSeatConfig;
+};
+
+if (!globalStore.__gsrtcRuntimeConfig) {
+  globalStore.__gsrtcRuntimeConfig = {
+    journeyDate: DEFAULT_JOURNEY_DATE,
+    cookie: process.env.GSRTC_COOKIE || DEFAULT_GSRTC_COOKIE,
+    service1Url: SERVICE_1_SEATER_URL,
+    service2Url: SERVICE_2_SLEEPER_URL,
+    ntfyTopic: process.env.NTFY_TOPIC || 'gsrtc-seat-radar-harsh-52769',
+    callmebotUrl: '',
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST' && req.method !== 'GET') {
     return res.status(405).json({ ok: false, error: 'Method Not Allowed' });
   }
 
   try {
+    const ramConfig = globalStore.__gsrtcRuntimeConfig!;
     const isGet = req.method === 'GET';
     const query = req.query || {};
     const body = isGet
@@ -109,26 +136,53 @@ export default async function handler(req: any, res: any) {
         ? JSON.parse(req.body || '{}')
         : req.body || {};
 
-    const journeyDate = body.journeyDate || query.date || DEFAULT_JOURNEY_DATE;
-    const cookie =
-      body.cookie || query.cookie || process.env.GSRTC_COOKIE || DEFAULT_GSRTC_COOKIE;
-    const service1Url = body.service1Url || SERVICE_1_SEATER_URL;
-    const service2Url = body.service2Url || SERVICE_2_SLEEPER_URL;
-    const ntfyTopic =
-      body.ntfyTopic ||
-      query.topic ||
-      process.env.NTFY_TOPIC ||
-      'gsrtc-seat-radar-harsh-52769';
+    // Update in-RAM config whenever new values are supplied from UI (POST) or query params
+    if (typeof body.journeyDate === 'string' && body.journeyDate.trim()) {
+      ramConfig.journeyDate = normalizeGsrtcDate(body.journeyDate);
+      ramConfig.updatedAt = new Date().toISOString();
+    } else if (typeof query.date === 'string' && query.date.trim()) {
+      ramConfig.journeyDate = normalizeGsrtcDate(query.date);
+      ramConfig.updatedAt = new Date().toISOString();
+    }
 
-    const activeDate = normalizeGsrtcDate(journeyDate);
-    const activeCookie =
-      (typeof cookie === 'string' && cookie.trim()) || DEFAULT_GSRTC_COOKIE;
-    const url1 =
-      (typeof service1Url === 'string' && service1Url.trim()) ||
-      SERVICE_1_SEATER_URL;
-    const url2 =
-      (typeof service2Url === 'string' && service2Url.trim()) ||
-      SERVICE_2_SLEEPER_URL;
+    if (typeof body.cookie === 'string' && body.cookie.trim()) {
+      ramConfig.cookie = body.cookie.trim();
+      ramConfig.updatedAt = new Date().toISOString();
+    } else if (typeof query.cookie === 'string' && query.cookie.trim()) {
+      ramConfig.cookie = query.cookie.trim();
+      ramConfig.updatedAt = new Date().toISOString();
+    }
+
+    if (typeof body.service1Url === 'string' && body.service1Url.trim()) {
+      ramConfig.service1Url = body.service1Url.trim();
+      ramConfig.updatedAt = new Date().toISOString();
+    }
+
+    if (typeof body.service2Url === 'string' && body.service2Url.trim()) {
+      ramConfig.service2Url = body.service2Url.trim();
+      ramConfig.updatedAt = new Date().toISOString();
+    }
+
+    if (typeof body.ntfyTopic === 'string' && body.ntfyTopic.trim()) {
+      ramConfig.ntfyTopic = body.ntfyTopic.trim();
+      ramConfig.updatedAt = new Date().toISOString();
+    } else if (typeof query.topic === 'string' && query.topic.trim()) {
+      ramConfig.ntfyTopic = query.topic.trim();
+      ramConfig.updatedAt = new Date().toISOString();
+    }
+
+    if (typeof body.callmebotUrl === 'string') {
+      ramConfig.callmebotUrl = body.callmebotUrl.trim();
+      ramConfig.updatedAt = new Date().toISOString();
+    }
+
+    const activeDate = normalizeGsrtcDate(
+      ramConfig.journeyDate || DEFAULT_JOURNEY_DATE
+    );
+    const activeCookie = ramConfig.cookie || DEFAULT_GSRTC_COOKIE;
+    const url1 = ramConfig.service1Url || SERVICE_1_SEATER_URL;
+    const url2 = ramConfig.service2Url || SERVICE_2_SLEEPER_URL;
+    const ntfyTopic = ramConfig.ntfyTopic || 'gsrtc-seat-radar-harsh-52769';
 
     const service1Probe = await probeSingleGsrtcService({
       rawUrl: url1,
@@ -155,8 +209,10 @@ export default async function handler(req: any, res: any) {
         .replace(/[^a-zA-Z0-9_-]/g, '');
 
       if (cleanTopic) {
-        const s1Labels = service1Probe.result.openSeatLabels.join(', ') || 'None';
-        const s2Labels = service2Probe.result.openSeatLabels.join(', ') || 'None';
+        const s1Labels =
+          service1Probe.result.openSeatLabels.join(', ') || 'None';
+        const s2Labels =
+          service2Probe.result.openSeatLabels.join(', ') || 'None';
         const title = toSafeByteStringHeader(
           `GSRTC OPEN: ${totalOpen} Seat(s) on ${activeDate}`
         );
@@ -188,11 +244,24 @@ export default async function handler(req: any, res: any) {
           cronNotificationSent = false;
         }
       }
+
+      if (
+        ramConfig.callmebotUrl &&
+        ramConfig.callmebotUrl.startsWith('http')
+      ) {
+        try {
+          await fetch(ramConfig.callmebotUrl, { method: 'GET' });
+        } catch {
+          // ignore callmebot error
+        }
+      }
     }
 
     return res.status(200).json({
       ok: true,
       journeyDate: activeDate,
+      ntfyTopic,
+      configUpdatedAt: ramConfig.updatedAt,
       totalOpen,
       cronNotificationSent,
       service1: service1Probe,
@@ -203,4 +272,5 @@ export default async function handler(req: any, res: any) {
     return res.status(500).json({ ok: false, error: msg });
   }
 }
+
 

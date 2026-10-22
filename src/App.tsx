@@ -208,6 +208,8 @@ export default function App() {
             service2Url: activeUrl2,
             cookie: activeCookie,
             journeyDate: activeDate,
+            ntfyTopic,
+            callmebotUrl,
           }),
         });
 
@@ -328,6 +330,8 @@ export default function App() {
       cookie,
       service1Url,
       service2Url,
+      ntfyTopic,
+      callmebotUrl,
       cooldownSec,
       dispatchPushAndCallAlert,
       pollIntervalSec,

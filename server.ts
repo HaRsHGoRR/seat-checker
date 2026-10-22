@@ -175,15 +175,29 @@ async function startServer() {
     });
   });
 
-  app.post('/api/check-dual-seats', async (req, res) => {
+  app.all('/api/check-dual-seats', async (req, res) => {
     try {
-      const { service1Url, service2Url, cookie, journeyDate } = req.body || {};
+      const body = req.method === 'GET' ? {} : req.body || {};
+      const query = req.query || {};
+
+      const {
+        service1Url,
+        service2Url,
+        cookie,
+        journeyDate,
+        ntfyTopic,
+        callmebotUrl,
+      } = body;
 
       const activeDate = normalizeGsrtcDate(
-        journeyDate || runtimeConfig.journeyDate || DEFAULT_JOURNEY_DATE
+        journeyDate ||
+          (typeof query.date === 'string' ? query.date : '') ||
+          runtimeConfig.journeyDate ||
+          DEFAULT_JOURNEY_DATE
       );
       const activeCookie =
         (typeof cookie === 'string' && cookie.trim()) ||
+        (typeof query.cookie === 'string' && query.cookie.trim()) ||
         runtimeConfig.cookie ||
         DEFAULT_GSRTC_COOKIE;
       const url1 =
@@ -194,6 +208,15 @@ async function startServer() {
         (typeof service2Url === 'string' && service2Url.trim()) ||
         runtimeConfig.service2Url ||
         SERVICE_2_SLEEPER_URL;
+
+      if (typeof ntfyTopic === 'string' && ntfyTopic.trim()) {
+        runtimeConfig.ntfyTopic = ntfyTopic.trim();
+      } else if (typeof query.topic === 'string' && query.topic.trim()) {
+        runtimeConfig.ntfyTopic = query.topic.trim();
+      }
+      if (typeof callmebotUrl === 'string') {
+        runtimeConfig.callmebotUrl = callmebotUrl.trim();
+      }
 
       runtimeConfig.journeyDate = activeDate;
       runtimeConfig.cookie = activeCookie;
@@ -211,12 +234,9 @@ async function startServer() {
         journeyDate: activeDate,
       });
 
-      const s1Open =
-        service1Probe.result.availableCount +
-        service1Probe.result.ladiesAvailableCount;
-      const s2Open =
-        service2Probe.result.availableCount +
-        service2Probe.result.ladiesAvailableCount;
+      const s1Open = service1Probe.result.availableCount;
+      const s2Open = service2Probe.result.availableCount;
+      const totalOpen = s1Open + s2Open;
       console.log(
         `[GSRTC POLL] ${new Date().toLocaleTimeString('en-US', { hour12: false })} | Date: ${activeDate} | 52769 (Seater): ${s1Open}/${service1Probe.result.totalSeats} Open | 52767 (Sleeper): ${s2Open}/${service2Probe.result.totalSeats} Open`
       );
@@ -224,6 +244,8 @@ async function startServer() {
       return res.json({
         ok: true,
         journeyDate: activeDate,
+        ntfyTopic: runtimeConfig.ntfyTopic,
+        totalOpen,
         service1: service1Probe,
         service2: service2Probe,
       });
