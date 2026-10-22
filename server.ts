@@ -246,18 +246,16 @@ async function startServer() {
 
       for (let i = 0; i < loopsToRun; i++) {
         const loopStartMs = Date.now();
-        const [service1Probe, service2Probe] = await Promise.all([
-          probeSingleGsrtcService({
-            rawUrl: url1,
-            cookie: activeCookie,
-            journeyDate: activeDate,
-          }),
-          probeSingleGsrtcService({
-            rawUrl: url2,
-            cookie: activeCookie,
-            journeyDate: activeDate,
-          }),
-        ]);
+        const service1Probe = await probeSingleGsrtcService({
+          rawUrl: url1,
+          cookie: activeCookie,
+          journeyDate: activeDate,
+        });
+        const service2Probe = await probeSingleGsrtcService({
+          rawUrl: url2,
+          cookie: activeCookie,
+          journeyDate: activeDate,
+        });
 
         lastService1Probe = service1Probe;
         lastService2Probe = service2Probe;

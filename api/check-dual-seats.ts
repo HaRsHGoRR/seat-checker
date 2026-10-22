@@ -103,6 +103,7 @@ interface RuntimeSeatConfig {
   ntfyTopic: string;
   callmebotUrl: string;
   updatedAt: string;
+  activeHalf2UntilMs?: number;
 }
 
 const globalStore = globalThis as unknown as {
@@ -118,10 +119,25 @@ if (!globalStore.__gsrtcRuntimeConfig) {
     ntfyTopic: process.env.NTFY_TOPIC || 'gsrtc-seat-radar-harsh-52769',
     callmebotUrl: '',
     updatedAt: new Date().toISOString(),
+    activeHalf2UntilMs: 0,
   };
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function formatIstTime(date = new Date()): string {
+  try {
+    return date.toLocaleTimeString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+  } catch {
+    return date.toISOString().slice(11, 19);
+  }
+}
 
 async function sendNtfyAndCallAlert(params: {
   ntfyTopic: string;
@@ -143,12 +159,13 @@ async function sendNtfyAndCallAlert(params: {
   if (cleanTopic) {
     const s1LabelsText = params.s1Labels.join(', ') || 'None';
     const s2LabelsText = params.s2Labels.join(', ') || 'None';
+    const timeStr = formatIstTime();
     const title = toSafeByteStringHeader(
-      `GSRTC OPEN: ${params.totalOpen} Seat(s) on ${params.activeDate}`
+      `GSRTC OPEN: ${params.totalOpen} Seat(s) on ${params.activeDate} [${params.checkLabel}]`
     );
     const message = [
       `Route: BARODA CENTRAL BUS STATION -> VERAVAL`,
-      `Date: ${params.activeDate} (21:00 Dept) [${params.checkLabel}]`,
+      `Date: ${params.activeDate} (21:00 Dept) | ${params.checkLabel} @ ${timeStr} IST`,
       `Seater 52769 (INR 328): ${params.s1Open} open (${s1LabelsText})`,
       `Sleeper 52767 (INR 423): ${params.s2Open} open (${s2LabelsText})`,
       `Book now: https://gsrtc.in/OPRSOnline/`,
@@ -260,13 +277,6 @@ export default async function handler(req: any, res: any) {
       20
     );
 
-    // Determine execution mode:
-    // 1. UI POST (no half, no loops): 1 immediate check so UI stays fast (~1s).
-    // 2. Cron GET (default, no params needed): 6 checks per minute (every 10s)!
-    //    - Half 1 runs Checks #1 (0s), #2 (10s), #3 (20s) (~21s total, well under cron-job.org's 30s timeout)
-    //      and spawns Half 2 in parallel at t=0s.
-    //    - Half 2 (?half=2) sleeps until t=30s and runs Checks #4 (30s), #5 (40s), #6 (50s).
-    // 3. Explicit ?loops=N (e.g. ?loops=6 or ?loops=1): runs N checks in this request.
     let loopsToRun = 1;
     let initialDelayMs = 0;
     let spawnSecondHalf = false;
@@ -276,14 +286,17 @@ export default async function handler(req: any, res: any) {
       loopsToRun = Math.min(explicitLoops, 6);
     } else if (halfParam === '2') {
       loopsToRun = 3;
-      initialDelayMs = 29000; // Wake up at ~30s mark for checks #4 (30s), #5 (40s), #6 (50s)
+      initialDelayMs = 30000; // Exact 30s mark for checks #4 (30s), #5 (40s), #6 (50s)
       checkIndexOffset = 3;
     } else if (isGet) {
       loopsToRun = 3; // Checks #1 (0s), #2 (10s), #3 (20s) -> responds in ~21s (<30s cron-job.org limit)
-      spawnSecondHalf = true;
+      const now = Date.now();
+      if (!ramConfig.activeHalf2UntilMs || now >= ramConfig.activeHalf2UntilMs) {
+        spawnSecondHalf = true;
+        ramConfig.activeHalf2UntilMs = now + 52000;
+      }
     }
 
-    // Fire companion Half 2 at t=0s so Vercel starts the second container while Half 1 stays alive for 21s
     let backgroundHalf2Promise: Promise<unknown> | null = null;
     if (spawnSecondHalf) {
       const proto = req.headers?.['x-forwarded-proto'] || 'https';
@@ -322,6 +335,7 @@ export default async function handler(req: any, res: any) {
     const checksSummary: Array<{
       checkNumber: number;
       timestamp: string;
+      istTime: string;
       s1Open: number;
       s2Open: number;
       totalOpen: number;
@@ -333,18 +347,19 @@ export default async function handler(req: any, res: any) {
       const loopStartMs = Date.now();
       const checkNumber = checkIndexOffset + i + 1;
 
-      const [service1Probe, service2Probe] = await Promise.all([
-        probeSingleGsrtcService({
-          rawUrl: url1,
-          cookie: activeCookie,
-          journeyDate: activeDate,
-        }),
-        probeSingleGsrtcService({
-          rawUrl: url2,
-          cookie: activeCookie,
-          journeyDate: activeDate,
-        }),
-      ]);
+      // IMPORTANT: Probe Service 1 (52769 Seater) and Service 2 (52767 Sleeper) SEQUENTIALLY!
+      // GSRTC uses a stateful Java HttpSession keyed by JSESSIONID; firing both requests at the
+      // exact same millisecond causes a session race where GSRTC returns Service 1's 30-seat HTML for both!
+      const service1Probe = await probeSingleGsrtcService({
+        rawUrl: url1,
+        cookie: activeCookie,
+        journeyDate: activeDate,
+      });
+      const service2Probe = await probeSingleGsrtcService({
+        rawUrl: url2,
+        cookie: activeCookie,
+        journeyDate: activeDate,
+      });
 
       lastService1Probe = service1Probe;
       lastService2Probe = service2Probe;
@@ -357,8 +372,7 @@ export default async function handler(req: any, res: any) {
       const shouldNotify =
         (isGet || body.autoNotify === true) &&
         totalOpen > 0 &&
-        Boolean(ntfyTopic) &&
-        (!anyNotificationSent || totalOpen > maxTotalOpen);
+        Boolean(ntfyTopic);
 
       if (shouldNotify) {
         notifiedThisTick = await sendNtfyAndCallAlert({
@@ -384,6 +398,7 @@ export default async function handler(req: any, res: any) {
       checksSummary.push({
         checkNumber,
         timestamp: new Date().toISOString(),
+        istTime: formatIstTime(),
         s1Open,
         s2Open,
         totalOpen,
@@ -398,7 +413,6 @@ export default async function handler(req: any, res: any) {
       }
     }
 
-    // Ensure the background request socket was flushed before returning
     if (backgroundHalf2Promise) {
       await Promise.race([backgroundHalf2Promise, sleep(250)]);
     }
@@ -430,6 +444,7 @@ export default async function handler(req: any, res: any) {
     return res.status(500).json({ ok: false, error: msg });
   }
 }
+
 
 
 
